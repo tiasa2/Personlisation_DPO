@@ -1580,6 +1580,13 @@ from dataclasses import dataclass, field
 from typing import Optional
 from datasets import load_dataset
 from tqdm import tqdm
+import os
+import torch
+import pandas as pd
+import re
+import time
+import json
+from vllm import LLM, SamplingParams
 
 @dataclass
 class ScriptArguments:
@@ -1599,27 +1606,236 @@ class ScriptArguments:
 
 
 
+# NLI functions from main_nli.py
+class LabelRestrictor:
+    def __init__(self, tokenizer, label_texts):
+        # assume each label is a single token (or use the last token)
+        self.label_ids = [
+            tokenizer.encode(" " + l, add_special_tokens=False)[-1]
+            for l in label_texts
+        ]
+
+    def __call__(self, input_ids, scores: torch.Tensor):
+        # scores: [vocab_size]
+        mask = torch.full_like(scores, float("-inf"))
+        mask[self.label_ids] = scores[self.label_ids]
+        return mask
+
+def reasoning_return(output):
+    match = re.search(r'### Reasoning:\s*(.*)', output, re.DOTALL)
+    if match:
+        extracted_text = match.group(1).strip()
+        return extracted_text
+    else:
+        return ""
+
+def answer_return(output):
+    match = re.search(r'### Selected Answer:\s*(.*)', output, re.DOTALL)
+    if match:
+        extracted_text = match.group(1).strip()
+        return extracted_text
+    else:
+        return ""
+
+def get_first_capital_letter(text):
+    for char in text:
+        if char.isupper():
+            return char
+    return None
+
+def correctness_check(real_answer, selected_answer):
+    if real_answer == selected_answer:
+        return 1
+    else:
+        return 0
+
+def classify_relevant_reasoning_against_axioms(reasoning_step, axioms, llm, target_tokenizer):
+    predicted_labels = []
+    prompts = []
+    relevance_prompts = []
+    for axiom in axioms:
+        relevance_prompt = f"""You are an axiom relevance classifier.
+
+            Given:
+            - Reasoning step: {reasoning_step}
+            - Candidate axiom: {axiom}
+
+            Task: Decide if this axiom is relevant to assessing the reasoning step.
+
+            Guidelines:
+            - Output "relevant" if the axiom related to the reasoning step, defines a term it uses, or provides a necessary condition the step depends on.
+            - Output "irrelevant" if the axiom is unrelated to the reasoning step, or does not interact with entities/relations in the step.
+            - If unsure, prefer "irrelevant".
+
+            Output format: Return exactly one word: "relevant" or "irrelevant". No extra text.
+            """
+        relevance_prompts.append(relevance_prompt)
+    
+    relevance_labels = ['relevant', 'irrelevant']
+    logits_processor = LabelRestrictor(target_tokenizer, relevance_labels)
+
+    relevance_gen_output = llm.generate(relevance_prompts, SamplingParams(
+                                    temperature=0, top_p=1,
+                                    max_tokens=1,
+                                    seed=0,
+                                    n=1,
+                                    logits_processors=[logits_processor]))
+    relevance_predicted_labels = [relevance_gen_output[index].outputs[0].text for index in range(len(relevance_prompts))]
+
+    relevant_axioms = [axioms[i] for i in range(len(axioms)) if relevance_predicted_labels[i].strip() == 'relevant']
+    if len(relevant_axioms) == 0:
+        return relevant_axioms, relevance_predicted_labels, 0
+    for axiom in relevant_axioms: 
+        prompt = f"""You are a logical reasoning validator. Given the axiom and reasoning step:
+        1. Axiom : {axiom}
+        2. Reasoning step {reasoning_step}
+
+        Your task is to determine the logical relationship:
+
+        -  Output "A" for entailment if the reasoning step logically follows from the axiom or vice versa
+        -  Output "B" for contradiction if the reasoning step contradicts the axiom or vice versa
+        Just respond with one of the two labels: 'A' or 'B'."""
+        prompts.append(prompt)
+
+    labels = ['A', 'B']
+    logits_processor = LabelRestrictor(target_tokenizer, labels)
+
+    gen_output = llm.generate(prompts, SamplingParams(
+                                    temperature=0, top_p=1,
+                                    max_tokens=1,
+                                    seed=0,
+                                    n=1,
+                                    logits_processors=[logits_processor]))
+    predicted_labels = [gen_output[index].outputs[0].text for index in range(len(prompts))]
+    if ' B' in predicted_labels:
+        for i in range(len(predicted_labels)):
+            if predicted_labels[i] == ' B':
+                print(relevant_axioms[i])
+        return relevant_axioms, predicted_labels, 0
+    return relevant_axioms, predicted_labels, 1
+
+def faithfulness_check(axioms, reasoning_chain, llm, target_tokenizer):
+    reasoning_list = reasoning_chain.split('.')
+    counter = 0
+    output_premises, output_predicted_labels, output_sum = [], [], 0
+    print('--------------------reasoning chain start-------------------')
+    for reason in reasoning_list:
+        if reason != '':
+            output_premise, output_predicted_labes, output = classify_relevant_reasoning_against_axioms(reason, axioms.split('\n')[1:], llm, target_tokenizer)
+            print('reason', output)
+            print('premise', output_premise)
+            output_premises.append(output_premise)
+            output_predicted_labels.append(output_predicted_labes)
+            output_sum += output
+            counter += 1
+    print('--------------------reasoning chain end-------------------')
+    if counter == 0:
+        return (output_premises, output_predicted_labels, 0)
+    print('faithfulness', output_sum/counter)
+    return (output_premises, output_predicted_labels, output_sum/counter)
+
 parser = HfArgumentParser(ScriptArguments)
 script_args = parser.parse_args_into_dataclasses()[0]
 
-ds = load_dataset("json",data_files=script_args.dataset_name_or_path, split="train")
+# Load NLI model for faithfulness checking
+available_gpus = os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(",")
+nli_llm = LLM(
+    model="Qwen/Qwen2.5-32B-Instruct",
+    tensor_parallel_size=len(available_gpus) // 1,
+    pipeline_parallel_size=1,
+    trust_remote_code=True,
+    max_model_len=1024
+)
+target_tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-32B-Instruct", trust_remote_code=True)
 
-import time
-import json
-from tqdm import tqdm
+# Load persona and axioms files (assume JSON format)
+with open("persona.json", "r") as f:
+    persona_data = json.load(f)
+
+with open("axioms.json", "r") as f:
+    axioms_data = json.load(f)
+
+# Load final_created.csv for option mappings
+df = pd.read_csv("eval/final_created.csv", index_col=0)
+options_list = ["A", "B", "C", "D", "E"]
+
+ds = load_dataset("json", data_files=script_args.dataset_name_or_path, split="train")
 #ds = ds.select(range(500))
 
 all_data = []
-for sample in tqdm(ds):
-    rewards = []
-    for ans in sample['responses']:
-        if is_equal(ans, sample['gt']) > 0:
-            rewards.append(1.0)
-        elif "\\boxed" in ans:
-            rewards.append(-0.5)
+for idx, sample in enumerate(tqdm(ds)):
+    faithfulness_scores = []
+    correctness_scores = []
+    
+    # Get axioms for this sample (assume indexed by problem ID or idx)
+    # First check if axioms are in the sample itself, then check external file
+    sample_axioms = sample.get('axioms', None)
+    if not sample_axioms:
+        sample_axioms = axioms_data.get(str(idx), axioms_data.get(idx, ""))
+        if isinstance(sample_axioms, dict):
+            # If it's a dict, extract the axioms text
+            sample_axioms = sample_axioms.get('axioms', sample_axioms.get('text', ""))
+    if not isinstance(sample_axioms, str):
+        sample_axioms = ""
+    
+    # Get option mapping from CSV (adjust key based on your data structure)
+    # This assumes the CSV has columns that match the problem structure
+    # You may need to adjust this based on how your data is indexed
+    try:
+        # Try to get option mapping - adjust this based on your CSV structure
+        option_mapping_key = sample.get('problem_id', str(idx))
+        if option_mapping_key in df.index:
+            option_mapping_str = df.loc[option_mapping_key, 'option_mapping'] if 'option_mapping' in df.columns else None
+            if option_mapping_str:
+                option_mapping = eval(eval(option_mapping_str))
+                temp = {option_mapping[j]: options_list[j] for j in range(len(option_mapping))}
+                real_answer_key = df.loc[option_mapping_key, 'response'] if 'response' in df.columns else None
+                if real_answer_key:
+                    real_answer = temp[eval(real_answer_key)]
+                else:
+                    real_answer = None
+            else:
+                real_answer = None
         else:
-            rewards.append(-1.0)
-    sample['rewards'] = rewards
+            real_answer = None
+    except Exception as e:
+        print(f"Error loading option mapping for sample {idx}: {e}")
+        real_answer = None
+    
+    for ans in sample['responses']:
+        # Extract reasoning and selected answer from response
+        reasoning_chain = reasoning_return(ans)
+        # If no reasoning marker found, try to extract from the full response
+        if not reasoning_chain and isinstance(ans, str):
+            # Fallback: use the full response as reasoning if no marker found
+            reasoning_chain = ans
+        
+        selected_answer_text = answer_return(ans)
+        if not selected_answer_text:
+            selected_answer_text = get_first_capital_letter(ans)
+        
+        # Compute faithfulness score
+        if sample_axioms and reasoning_chain:
+            faithfulness_output = faithfulness_check(sample_axioms, reasoning_chain, nli_llm, target_tokenizer)
+            faithfulness_score = faithfulness_output[2]  # Returns (premises, labels, score)
+        else:
+            faithfulness_score = 0.0
+        
+        # Compute correctness score
+        if real_answer and selected_answer_text:
+            correctness_score = correctness_check(real_answer, selected_answer_text)
+        else:
+            # Fallback to original correctness check if option mapping not available
+            correctness_score = 1.0 if is_equal(ans, sample['gt']) else 0.0
+        
+        faithfulness_scores.append(faithfulness_score)
+        correctness_scores.append(correctness_score)
+    
+    sample['faithfulness_scores'] = faithfulness_scores
+    sample['correctness_scores'] = correctness_scores
+    # Keep old rewards for backward compatibility, but you can remove this
+    sample['rewards'] = correctness_scores  # Or combine as needed
     all_data.append(sample)
-with open(script_args.output_dir,"w") as f:
-    json.dump(all_data,f,indent=4,ensure_ascii=False)
+
+with open(script_args.output_dir, "w") as f:
+    json.dump(all_data, f, indent=4, ensure_ascii=False)
